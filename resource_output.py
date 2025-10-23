@@ -28,11 +28,17 @@ from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Alignment
 from botocore.exceptions import ClientError # 권한 없는 서비스 건너 뛰고 수행용
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
+from openpyxl.styles import Alignment
+from datetime import datetime, timezone
 
 import time
 from datetime import datetime, timezone
 
 from collections import defaultdict, Counter
+
+from datetime import datetime, timezone
 
 # ============================================================
 # 0) 자격증명 하드코딩
@@ -144,6 +150,73 @@ def safe_call(fn, *, on_skip:str="", **kwargs):
         raise
 
 # for page in paginator.paginate(): -> for page in safe_paginate(paginator): 대체
+
+def _split_status_details(details: str) -> list[tuple[str, int]]:
+    """
+    'running:3 | stopped:1' → [("running",3), ("stopped",1)]
+    그 외(빈 문자열/상태 없음) → []
+    """
+    if not details:
+        return []
+    parts = [p.strip() for p in details.split("|")]
+    kv = []
+    for p in parts:
+        if not p:
+            continue
+        if ":" in p:
+            k, v = p.split(":", 1)
+            k = k.strip()
+            try:
+                v = int(v.strip())
+            except ValueError:
+                # status:ACTIVE 같은 1개 값일 수도 있으니 숫자 아님 → 1로 간주
+                v = 1 if p.strip() else 0
+            kv.append((k, v))
+        else:
+            # 'status:ACTIVE' 처럼 콜론이 하나만인 케이스 방어
+            # 또는 'Enabled' 단독 같은 값 → 1로 간주
+            kv.append((p, 1))
+    # 0 값 필터링
+    return [(k, v) for k, v in kv if v > 0]
+
+def _label_from_tags(tags: list[dict]) -> str:
+    """노드 라벨 결정 우선순위"""
+    m = {t.get("Key"): t.get("Value") for t in (tags or [])}
+    return (
+        m.get("eks:nodegroup-name")
+        or m.get("karpenter.sh/provisioner-name")
+        or m.get("aws:autoscaling:groupName")
+        or "unknown"
+    )
+
+def _split_status_details_pairs(details: str) -> list[tuple[str, str]]:
+    """
+    'running:3 | stopped:1' → [('running','3'), ('stopped','1')]
+    'status:ACTIVE'         → [('status:ACTIVE','')]   # 비정수 값은 갯수 공란
+    'Enabled'               → [('Enabled','')]         # 키:값 형태가 아니면 상태만
+    공백/빈값               → []
+    """
+    if not details or not isinstance(details, str):
+        return []
+    parts = [p.strip() for p in details.split("|") if p.strip()]
+    pairs: list[tuple[str, str]] = []
+    for p in parts:
+        if ":" in p:
+            k, v = p.split(":", 1)
+            k = k.strip()
+            v = v.strip()
+            # v가 숫자면 갯수로, 아니면 상태 문자열로만 취급
+            if v.isdigit():
+                pairs.append((k, v))
+            else:
+                pairs.append((f"{k}:{v}", ""))  # 상태만, 갯수 공란
+        else:
+            pairs.append((p, ""))  # 상태만, 갯수 공란
+    return pairs
+
+
+
+
 
 # ============================================================
 # 3) 수집기 (리전형 / 글로벌형)
@@ -412,6 +485,56 @@ def collect_eks(session, regions):
                 print(f"[EKS][{region}][{name}] version=v{ver}, status={status}")
     return rows
 
+def collect_eks_tree(session, regions):
+    """
+    EKS 트리 출력:
+    - 1) EKS(클러스터) 행 : 타입 "<cluster> | v<version>", 총=1, 상세 "status:ACTIVE"
+    - 2) 바로 아래 노드(서비스명 공백) 행들 : 타입 "<nodeLabel> | <instanceType>", 총=노드수, 상세 "running:n | ..."
+    """
+    rows = []
+    for region in regions:
+        eks = session.client("eks", region_name=region, config=BOTO_CONFIG)
+        ec2 = session.client("ec2", region_name=region, config=BOTO_CONFIG)
+
+        paginator = eks.get_paginator("list_clusters")
+        for page in safe_paginate(paginator, on_skip=f"EKS[{region}].list_clusters"):
+            for cluster in page.get("clusters", []):
+                # --- 클러스터 행
+                desc = safe_call(eks.describe_cluster, on_skip=f"EKS[{region}].describe_cluster", name=cluster)
+                cl = desc.get("cluster") or {}
+                ver = cl.get("version", "unknown")
+                status = cl.get("status", "unknown")
+                type_label = f"{cluster} | v{ver}"
+                rows.append((ACCOUNT_ALIAS_OR_NAME, region, "EKS", type_label, 1, f"status:{status}"))
+                print(f"[EKS][{region}][{cluster}] version=v{ver}, status={status}")
+
+                # --- 노드 집계(EC2)
+                filters = [
+                    {"Name": f"tag:kubernetes.io/cluster/{cluster}", "Values": ["owned", "shared"]},
+                ]
+                type_state_by_node_label: dict[tuple[str, str], Counter] = defaultdict(Counter)
+                inst_p = ec2.get_paginator("describe_instances")
+                for ipage in safe_paginate(inst_p,
+                                           on_skip=f"EKS-Nodes[{region}].describe_instances:{cluster}",
+                                           Filters=filters):
+                    for res in ipage.get("Reservations", []):
+                        for inst in res.get("Instances", []):
+                            itype = inst.get("InstanceType", "unknown")
+                            state = (inst.get("State") or {}).get("Name", "unknown")
+                            node_label = _label_from_tags(inst.get("Tags", []))
+                            type_state_by_node_label[(node_label, itype)][state] += 1
+
+                # 노드 행 추가 (서비스명 공백으로 트리 시각화)
+                for (node_label, itype), cnt in sorted(type_state_by_node_label.items()):
+                    total = sum(cnt.values())
+                    if not total:
+                        continue
+                    details = " | ".join(f"{k}:{v}" for k, v in sorted(cnt.items()))
+                    typelabel = f"{node_label} | {itype}"
+                    rows.append(("", region, "", typelabel, total, details))
+                    print(f"[EKS-Nodes][{region}][{cluster}][{node_label}][{itype}] total={total}, {details}")
+
+    return rows
 
 
 from collections import defaultdict, Counter
@@ -660,20 +783,40 @@ def collect_opensearch(session, regions):
 # 4) 엑셀 저장
 # ============================================================
 def save_to_excel(rows, outfile):
+    """
+    rows: (계정명, 지역, 서비스명, 타입, 총 갯수, 상세문자열) 튜플 리스트
+    - 상세문자열을 '상태/상태별 갯수' 2열로 분해
+    - 상태가 여러개면 행으로 분리, 2행째부터는 앞 열(계정명/지역/서비스명/타입/총 갯수)은 공란
+    """
     wb = Workbook()
     ws = wb.active
     ws.title = "Inventory"
 
-    headers = ["계정명", "지역", "서비스명", "타입", "총 갯수", "동작 상태별 갯수", "생성시각(UTC)"]
+    headers = ["계정명", "지역", "서비스명", "타입", "총 갯수", "상태", "상태별 갯수", "생성시각(UTC)"]
     ws.append(headers)
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    for acc, region, svc, typ, total, details in rows:
-        ws.append([acc, region, svc, typ, total, details, ts])
 
-    for col_idx, width in enumerate([18, 16, 22, 24, 10, 90, 20], start=1):
-        ws.column_dimensions[get_column_letter(col_idx)].width = width
-    for r in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=7):
+    for acc, region, svc, typ, total, details in rows:
+        pairs = _split_status_details_pairs(details)
+        if not pairs:
+            # 상태가 없으면 상태/갯수 공란으로 단일 행
+            ws.append([acc, region, svc, typ, total, "", "", ts])
+            continue
+
+        # 첫 상태 행: 모든 컬럼 채움
+        s0, c0 = pairs[0]
+        ws.append([acc, region, svc, typ, total, s0, c0, ts])
+
+        # 이후 상태 행: 앞 열 공란, 상태/갯수만 채움
+        for s, c in pairs[1:]:
+            ws.append(["", "", "", "", "", s, c, ""])
+
+    # 보기 좋게 너비/정렬
+    col_widths = [18, 16, 22, 30, 10, 20, 14, 20]
+    for idx, w in enumerate(col_widths, start=1):
+        ws.column_dimensions[get_column_letter(idx)].width = w
+    for r in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=len(headers)):
         for cell in r:
             cell.alignment = Alignment(vertical="top", wrap_text=True)
 
@@ -720,8 +863,9 @@ def main():
     _run_collect(collect_dynamodb, session, regions, all_rows, "DynamoDB")
     _run_collect(collect_elb, session, regions, all_rows, "ELB")
     _run_collect(collect_lambda, session, regions, all_rows, "Lambda")
-    _run_collect(collect_eks, session, regions, all_rows, "EKS")
-    _run_collect(collect_eks_nodes, session, regions, all_rows, "EKS-Nodes")
+    #_run_collect(collect_eks, session, regions, all_rows, "EKS")
+    #_run_collect(collect_eks_nodes, session, regions, all_rows, "EKS-Nodes")
+    _run_collect(collect_eks_tree, session, regions, all_rows, "EKS-Tree")
     _run_collect(collect_ecs, session, regions, all_rows, "ECS")
     _run_collect(collect_ecr, session, regions, all_rows, "ECR")
     _run_collect(collect_apigw, session, regions, all_rows, "APIGW")
