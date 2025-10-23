@@ -1,0 +1,86 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Sid": "EC2Core", "Effect": "Allow", "Action": [
+      "ec2:DescribeRegions",
+      "ec2:DescribeInstances",
+      "ec2:DescribeVolumes"
+    ], "Resource": "*" },
+
+    { "Sid": "S3List", "Effect": "Allow", "Action": [
+      "s3:ListAllMyBuckets",
+      "s3:GetBucketVersioning"
+    ], "Resource": "*" },
+
+    { "Sid": "RDSRead", "Effect": "Allow", "Action": [
+      "rds:DescribeDBInstances"
+    ], "Resource": "*" },
+
+    { "Sid": "ElastiCacheRead", "Effect": "Allow", "Action": [
+      "elasticache:DescribeReplicationGroups"
+    ], "Resource": "*" },
+
+    { "Sid": "DynamoDBRead", "Effect": "Allow", "Action": [
+      "dynamodb:ListTables",
+      "dynamodb:DescribeTable"
+    ], "Resource": "*" },
+
+    { "Sid": "Route53Read", "Effect": "Allow", "Action": [
+      "route53:ListHostedZones"
+    ], "Resource": "*" },
+
+    { "Sid": "ELBRead", "Effect": "Allow", "Action": [
+      "elasticloadbalancing:DescribeLoadBalancers"
+    ], "Resource": "*" },
+
+    { "Sid": "CloudFrontRead", "Effect": "Allow", "Action": [
+      "cloudfront:ListDistributions"
+    ], "Resource": "*" },
+
+    { "Sid": "LambdaRead", "Effect": "Allow", "Action": [
+      "lambda:ListFunctions"
+    ], "Resource": "*" },
+
+    { "Sid": "EKSRead", "Effect": "Allow", "Action": [
+      "eks:ListClusters",
+      "eks:DescribeCluster"
+    ], "Resource": "*" },
+
+    { "Sid": "ECSRead", "Effect": "Allow", "Action": [
+      "ecs:ListClusters",
+      "ecs:DescribeClusters",
+      "ecs:ListServices",
+      "ecs:DescribeServices"
+    ], "Resource": "*" },
+
+    { "Sid": "ECRRead", "Effect": "Allow", "Action": [
+      "ecr:DescribeRepositories",
+      "ecr:ListImages"
+    ], "Resource": "*" },
+
+    { "Sid": "ApiGatewayV1Read", "Effect": "Allow", "Action": [
+      "apigateway:GET"
+    ], "Resource": "*" },
+
+    { "Sid": "ApiGatewayV2Read", "Effect": "Allow", "Action": [
+      "apigatewayv2:ListApis"
+    ], "Resource": "*" },
+
+    { "Sid": "SQSRead", "Effect": "Allow", "Action": [
+      "sqs:ListQueues"
+    ], "Resource": "*" },
+
+    { "Sid": "SNSRead", "Effect": "Allow", "Action": [
+      "sns:ListTopics"
+    ], "Resource": "*" },
+
+    { "Sid": "OpenSearchServiceRead", "Effect": "Allow", "Action": [
+      "opensearch:ListDomainNames",
+      "opensearch:DescribeDomain"
+    ], "Resource": "*" },
+
+    { "Sid": "OpenSearchServerlessRead", "Effect": "Allow", "Action": [
+      "aoss:ListCollections"
+    ], "Resource": "*" }
+  ]
+}
