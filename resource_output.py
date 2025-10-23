@@ -15,9 +15,11 @@ OpenSearch(Service/Serverless)
 pip install boto3 botocore openpyxl
 """
 
+
 import sys
 from collections import defaultdict, Counter
 from datetime import datetime, timezone
+
 
 import boto3
 from botocore.config import Config
@@ -26,6 +28,11 @@ from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Alignment
 from botocore.exceptions import ClientError # 권한 없는 서비스 건너 뛰고 수행용
+
+import time
+from datetime import datetime, timezone
+
+from collections import defaultdict, Counter
 
 # ============================================================
 # 0) 자격증명 하드코딩
@@ -147,33 +154,43 @@ def collect_ec2(session, regions):
     rows = []
     for region in regions:
         ec2 = session.client("ec2", region_name=region, config=BOTO_CONFIG)
-        counter = Counter()
+        # 타입별 상태 카운트
+        type_state = defaultdict(Counter)
         paginator = ec2.get_paginator("describe_instances")
-        for page in safe_paginate(paginator):
+        for page in safe_paginate(paginator, on_skip=f"EC2[{region}].describe_instances"):
             for r in page.get("Reservations", []):
                 for i in r.get("Instances", []):
+                    itype = i.get("InstanceType", "unknown")
                     state = i.get("State", {}).get("Name", "unknown")
-                    dict_counter_add(counter, state)
-        total, details = summarize_counter(counter)
-        if total:
-            rows.append((ACCOUNT_ALIAS_OR_NAME, region, "EC2", "Instances", total, details))
-            print(f"[EC2][{region}] total={total}, {details}")
+                    type_state[itype][state] += 1
+        for itype, cnt in sorted(type_state.items()):
+            total = sum(cnt.values())
+            if not total:
+                continue
+            details = " | ".join(f"{k}:{v}" for k, v in sorted(cnt.items()))
+            rows.append((ACCOUNT_ALIAS_OR_NAME, region, "EC2", itype, total, details))
+            print(f"[EC2][{region}][{itype}] total={total}, {details}")
     return rows
+
 
 def collect_ebs(session, regions):
     rows = []
     for region in regions:
         ec2 = session.client("ec2", region_name=region, config=BOTO_CONFIG)
-        counter = Counter()
+        type_state = defaultdict(Counter)
         paginator = ec2.get_paginator("describe_volumes")
-        for page in safe_paginate(paginator):
+        for page in safe_paginate(paginator, on_skip=f"EBS[{region}].describe_volumes"):
             for v in page.get("Volumes", []):
-                state = v.get("State", "unknown")  # in-use / available
-                dict_counter_add(counter, state)
-        total, details = summarize_counter(counter)
-        if total:
-            rows.append((ACCOUNT_ALIAS_OR_NAME, region, "EBS", "Volumes", total, details))
-            print(f"[EBS][{region}] total={total}, {details}")
+                vtype = v.get("VolumeType", "unknown")   # gp2/gp3/io1/io2/st1/sc1/standard
+                state = v.get("State", "unknown")        # in-use/available
+                type_state[vtype][state] += 1
+        for vtype, cnt in sorted(type_state.items()):
+            total = sum(cnt.values())
+            if not total:
+                continue
+            details = " | ".join(f"{k}:{v}" for k, v in sorted(cnt.items()))
+            rows.append((ACCOUNT_ALIAS_OR_NAME, region, "EBS", vtype, total, details))
+            print(f"[EBS][{region}][{vtype}] total={total}, {details}")
     return rows
 
 def collect_s3(session):
@@ -197,34 +214,45 @@ def collect_rds(session, regions):
     rows = []
     for region in regions:
         rds = session.client("rds", region_name=region, config=BOTO_CONFIG)
-        engine_state = defaultdict(Counter)
+        cls_state = defaultdict(Counter)  # db.t3.medium -> {available:n, ...}
         paginator = rds.get_paginator("describe_db_instances")
-        for page in safe_paginate(paginator):
+        for page in safe_paginate(paginator, on_skip=f"RDS[{region}].describe_db_instances"):
             for db in page.get("DBInstances", []):
-                engine = db.get("Engine", "unknown")
+                dbclass = db.get("DBInstanceClass", "unknown")
                 status = db.get("DBInstanceStatus", "unknown")
-                engine_state[engine][status] += 1
-        for eng, cnt in engine_state.items():
-            total, details = summarize_counter(cnt)
-            rows.append((ACCOUNT_ALIAS_OR_NAME, region, "RDS", eng, total, details))
-            print(f"[RDS][{region}][{eng}] total={total}, {details}")
+                cls_state[dbclass][status] += 1
+        for dbclass, cnt in sorted(cls_state.items()):
+            total = sum(cnt.values())
+            if not total:
+                continue
+            details = " | ".join(f"{k}:{v}" for k, v in sorted(cnt.items()))
+            rows.append((ACCOUNT_ALIAS_OR_NAME, region, "RDS", dbclass, total, details))
+            print(f"[RDS][{region}][{dbclass}] total={total}, {details}")
     return rows
+
 
 def collect_elasticache_redis(session, regions):
     rows = []
     for region in regions:
         ec = session.client("elasticache", region_name=region, config=BOTO_CONFIG)
-        counter = Counter()
-        paginator = ec.get_paginator("describe_replication_groups")
-        for page in safe_paginate(paginator):
-            for rg in page.get("ReplicationGroups", []):
-                status = rg.get("Status", "unknown")
-                dict_counter_add(counter, status)
-        total, details = summarize_counter(counter)
-        if total:
-            rows.append((ACCOUNT_ALIAS_OR_NAME, region, "ElastiCache", "Redis", total, details))
-            print(f"[ElastiCache-Redis][{region}] total={total}, {details}")
+        type_state = defaultdict(Counter)
+        paginator = ec.get_paginator("describe_cache_clusters")
+        for page in safe_paginate(paginator, on_skip=f"ElastiCache[{region}].describe_cache_clusters"):
+            for cl in page.get("CacheClusters", []):
+                if cl.get("Engine", "").lower() != "redis":
+                    continue
+                ctype = cl.get("CacheNodeType", "unknown")         # cache.t3.micro 등
+                status = cl.get("CacheClusterStatus", "unknown")   # available 등
+                type_state[ctype][status] += 1
+        for ctype, cnt in sorted(type_state.items()):
+            total = sum(cnt.values())
+            if not total:
+                continue
+            details = " | ".join(f"{k}:{v}" for k, v in sorted(cnt.items()))
+            rows.append((ACCOUNT_ALIAS_OR_NAME, region, "ElastiCache", ctype, total, details))
+            print(f"[ElastiCache-Redis][{region}][{ctype}] total={total}, {details}")
     return rows
+
 
 def collect_dynamodb(session, regions):
     rows = []
@@ -356,62 +384,143 @@ def collect_lambda(session, regions):
     return rows
 
 def collect_eks(session, regions):
+    """
+    EKS 클러스터별 행 생성
+    - 타입 : "<clusterName> | v<version>"
+    - 총 갯수 : 1 (클러스터 단위)
+    - 상세 : status:<STATUS>
+    """
     rows = []
     for region in regions:
         eks = session.client("eks", region_name=region, config=BOTO_CONFIG)
-        state_counter = Counter()
         paginator = eks.get_paginator("list_clusters")
-        for page in safe_paginate(paginator):
+        for page in safe_paginate(paginator, on_skip=f"EKS[{region}].list_clusters"):
             for name in page.get("clusters", []):
-                desc = safe_get(eks.describe_cluster, name=name)
-                status = (desc.get("cluster") or {}).get("status", "unknown")
-                dict_counter_add(state_counter, status)
-        if sum(state_counter.values()):
-            total, details = summarize_counter(state_counter)
-            rows.append((ACCOUNT_ALIAS_OR_NAME, region, "EKS", "Clusters", total, details))
-            print(f"[EKS][{region}] clusters={total}, {details}")
+                desc = safe_call(eks.describe_cluster, on_skip=f"EKS[{region}].describe_cluster", name=name)
+                cl = desc.get("cluster") or {}
+                ver = cl.get("version", "unknown")
+                status = cl.get("status", "unknown")
+                type_label = f"{name} | v{ver}"
+                rows.append((
+                    ACCOUNT_ALIAS_OR_NAME,
+                    region,
+                    "EKS",
+                    type_label,
+                    1,                      # 클러스터 1개
+                    f"status:{status}"
+                ))
+                print(f"[EKS][{region}][{name}] version=v{ver}, status={status}")
     return rows
+
+
+
+from collections import defaultdict, Counter
+
+def collect_eks_nodes(session, regions):
+    """
+    EKS 노드 집계 (EC2 인스턴스 태그 기반)
+    - 태그: kubernetes.io/cluster/<CLUSTER_NAME> = owned | shared
+    - 타입 : "<clusterName> | <instanceType>" (예: "prod-cluster | c5.xlarge")
+    - 총 갯수 : 해당 타입 노드 수
+    - 상세 : 상태별 카운트 (running, stopped 등)
+    """
+    rows = []
+    for region in regions:
+        eks = session.client("eks", region_name=region, config=BOTO_CONFIG)
+        ec2 = session.client("ec2", region_name=region, config=BOTO_CONFIG)
+
+        # cluster -> instanceType -> stateCounter
+        cluster_type_state: dict[str, dict[str, Counter]] = defaultdict(lambda: defaultdict(Counter))
+
+        # 1) 클러스터 목록
+        paginator = eks.get_paginator("list_clusters")
+        for page in safe_paginate(paginator, on_skip=f"EKS[{region}].list_clusters"):
+            for cluster in page.get("clusters", []):
+                # 2) 클러스터 노드(EC2) 조회
+                filters = [
+                    {"Name": f"tag:kubernetes.io/cluster/{cluster}", "Values": ["owned", "shared"]},
+                    # 필요 시 상태 제한 (예: running만) → 아래 주석 해제
+                    # {"Name": "instance-state-name", "Values": ["pending", "running", "stopping", "stopped"]}
+                ]
+                inst_p = ec2.get_paginator("describe_instances")
+                for ipage in safe_paginate(inst_p,
+                                           on_skip=f"EKS-Nodes[{region}].describe_instances:{cluster}",
+                                           Filters=filters):
+                    for res in ipage.get("Reservations", []):
+                        for inst in res.get("Instances", []):
+                            itype = inst.get("InstanceType", "unknown")
+                            state = (inst.get("State") or {}).get("Name", "unknown")
+                            cluster_type_state[cluster][itype][state] += 1
+
+        # 3) 행 생성
+        for cluster, type_map in sorted(cluster_type_state.items()):
+            for itype, cnt in sorted(type_map.items()):
+                total = sum(cnt.values())
+                if not total:
+                    continue
+                details = " | ".join(f"{k}:{v}" for k, v in sorted(cnt.items()))
+                type_label = f"{cluster} | {itype}"
+                rows.append((
+                    ACCOUNT_ALIAS_OR_NAME,
+                    region,
+                    "EKS-Nodes",
+                    type_label,
+                    total,
+                    details
+                ))
+                print(f"[EKS-Nodes][{region}][{cluster}][{itype}] total={total}, {details}")
+    return rows
+
+
 
 def collect_ecs(session, regions):
     rows = []
     for region in regions:
         ecs = session.client("ecs", region_name=region, config=BOTO_CONFIG)
-        # 클러스터
+
+        # Clusters(기존 유지)
         cluster_state = Counter()
         clusters = []
         paginator = ecs.get_paginator("list_clusters")
-        for page in safe_paginate(paginator):
+        for page in safe_paginate(paginator, on_skip=f"ECS[{region}].list_clusters"):
             clusters += page.get("clusterArns", [])
+
         if clusters:
             for i in range(0, len(clusters), 100):
                 part = clusters[i:i+100]
-                resp = safe_get(ecs.describe_clusters, clusters=part, include=['STATISTICS'])
-                for c in resp.get("clusters", []):
-                    status = c.get("status", "UNKNOWN")  # ACTIVE/INACTIVE
-                    dict_counter_add(cluster_state, status)
+                resp = safe_call(ecs.describe_clusters, on_skip=f"ECS[{region}].describe_clusters", clusters=part, include=['STATISTICS'])
+                for c in (resp.get("clusters") or []):
+                    cluster_state[c.get("status","UNKNOWN")] += 1
         if sum(cluster_state.values()):
-            total, details = summarize_counter(cluster_state)
+            total = sum(cluster_state.values())
+            details = " | ".join(f"{k}:{v}" for k, v in sorted(cluster_state.items()))
             rows.append((ACCOUNT_ALIAS_OR_NAME, region, "ECS", "Clusters", total, details))
-            print(f"[ECS][{region}] clusters={total}, {details}")
+            print(f"[ECS][{region}][Clusters] total={total}, {details}")
 
-        # 서비스
-        service_state = Counter()
+        # Services : LaunchType 별
+        lt_state = defaultdict(Counter)
         for arn in clusters:
             svc_arns = []
             paginator = ecs.get_paginator("list_services")
-            for page in paginator.paginate(cluster=arn):
+            for page in safe_paginate(paginator, on_skip=f"ECS[{region}].list_services", cluster=arn):
                 svc_arns += page.get("serviceArns", [])
             for i in range(0, len(svc_arns), 10):
                 part = svc_arns[i:i+10]
-                resp = safe_get(ecs.describe_services, cluster=arn, services=part)
-                for s in resp.get("services", []):
+                resp = safe_call(ecs.describe_services, on_skip=f"ECS[{region}].describe_services", cluster=arn, services=part)
+                for s in (resp.get("services") or []):
+                    lt = (s.get("launchType") or "UNKNOWN").upper()  # EC2/FARGATE/EXTERNAL
                     status = s.get("status", "UNKNOWN")
-                    dict_counter_add(service_state, status)
-        if sum(service_state.values()):
-            total, details = summarize_counter(service_state)
-            rows.append((ACCOUNT_ALIAS_OR_NAME, region, "ECS", "Services", total, details))
-            print(f"[ECS][{region}] services={total}, {details}")
+                    lt_state[lt][status] += 1
+
+        for lt, cnt in sorted(lt_state.items()):
+            total = sum(cnt.values())
+            if not total:
+                continue
+            details = " | ".join(f"{k}:{v}" for k, v in sorted(cnt.items()))
+            rows.append((ACCOUNT_ALIAS_OR_NAME, region, "ECS", lt, total, details))
+            print(f"[ECS][{region}][{lt}] total={total}, {details}")
     return rows
+
 
 def collect_ecr(session, regions):
     rows = []
@@ -572,18 +681,29 @@ def save_to_excel(rows, outfile):
     print(f"[OK] Excel 저장 완료 : {outfile}")
 
 def _run_collect(collector, session, regions_or_none, sink_rows, label):
+    start = time.perf_counter()
+    before = len(sink_rows)
     try:
         if regions_or_none is None:
-            sink_rows += collector(session)  # 글로벌형
+            sink_rows += collector(session)              # 글로벌형
         else:
             sink_rows += collector(session, regions_or_none)  # 리전형
     except Exception as e:
         print(f"[WARN] collector {label} failed (continue): {e}")
+    finally:
+        elapsed = time.perf_counter() - start
+        added = len(sink_rows) - before
+        print(f"[TIME] {label} elapsed={elapsed:.3f}s, rows+={added}")
+
 
 # ============================================================
 # 5) 메인
 # ============================================================
 def main():
+    t_total = time.perf_counter()
+    started_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
+    print(f"[INFO] 시작(UTC) : {started_at}")
+
     print("[INFO] 세션 생성…")
     session = make_session()
 
@@ -601,6 +721,7 @@ def main():
     _run_collect(collect_elb, session, regions, all_rows, "ELB")
     _run_collect(collect_lambda, session, regions, all_rows, "Lambda")
     _run_collect(collect_eks, session, regions, all_rows, "EKS")
+    _run_collect(collect_eks_nodes, session, regions, all_rows, "EKS-Nodes")
     _run_collect(collect_ecs, session, regions, all_rows, "ECS")
     _run_collect(collect_ecr, session, regions, all_rows, "ECR")
     _run_collect(collect_apigw, session, regions, all_rows, "APIGW")
@@ -619,6 +740,11 @@ def main():
 
     out_name = f"aws_inventory_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
     save_to_excel(all_rows, out_name)
+
+    ended_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
+    total_elapsed = time.perf_counter() - t_total
+    print(f"[INFO] 종료(UTC) : {ended_at}")
+    print(f"[TIME] TOTAL elapsed={total_elapsed:.3f}s, rows={len(all_rows)}")
 
 if __name__ == "__main__":
     main()
